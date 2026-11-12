@@ -2414,26 +2414,99 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
         Logger.debug("Cache copy complete")
     }
 
+    /// Reads the registry's /v2/ 401 challenge to find its token realm and service name.
+    /// Falls back to the Docker Hub-style https://<registry>/token when no challenge is sent.
+    private func discoverTokenEndpoint() async -> (realm: String, service: String?) {
+        let fallback = ("https://\(self.registry)/token", Optional(self.registry))
+        guard let probeURL = URL(string: "https://\(self.registry)/v2/") else { return fallback }
+        var request = URLRequest(url: probeURL)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
+        request.httpMethod = "GET"
+        guard let (_, response) = try? await URLSession.shared.data(for: request),
+            let http = response as? HTTPURLResponse,
+            let header = http.value(forHTTPHeaderField: "WWW-Authenticate"),
+            header.lowercased().hasPrefix("bearer")
+        else {
+            Logger.debug("No bearer challenge from registry; using fallback token endpoint")
+            return fallback
+        }
+        let params = Self.parseChallengeParameters(header)
+        guard let realm = params["realm"], !realm.isEmpty else {
+            Logger.debug("Bearer challenge without realm; using fallback token endpoint")
+            return fallback
+        }
+        Logger.debug(
+            "Registry token endpoint: realm=\(realm) service=\(params["service"] ?? "-")")
+        return (realm, params["service"])
+    }
+
+    /// Parses `Bearer realm="...",service="..."` into a dictionary, honouring quoted commas.
+    private static func parseChallengeParameters(_ header: String) -> [String: String] {
+        var values: [String: String] = [:]
+        guard let spaceIndex = header.firstIndex(of: " ") else { return values }
+        var parts: [String] = []
+        var current = ""
+        var inQuotes = false
+        for character in header[header.index(after: spaceIndex)...] {
+            if character == "\"" {
+                inQuotes.toggle()
+                current.append(character)
+            } else if character == "," && !inQuotes {
+                parts.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        parts.append(current)
+        for part in parts {
+            let pair = part.split(separator: "=", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+            guard pair.count == 2 else { continue }
+            var value = pair[1]
+            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            }
+            values[pair[0].lowercased()] = value
+        }
+        return values
+    }
+
     private func getToken(
         repository: String, scopes: [String] = ["pull"], requireAllScopes: Bool = false
     ) async throws
         -> String
     {
-        let encodedRepo =
-            repository.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? repository
-
         // Build scope string from scopes array
         let scopeString = scopes.joined(separator: ",")
 
         Logger.debug("Requesting token with scopes: \(scopeString) for repository: \(repository)")
 
-        // Request both pull and push scope for uploads
-        let url = URL(
-            string:
-                "https://\(self.registry)/token?scope=repository:\(encodedRepo):\(scopeString)&service=\(self.registry)"
-        )!
+        // Discover the token service from the registry's v2 auth challenge instead of
+        // assuming Docker Hub's /token layout. Harbor serves /service/token and rejects
+        // any other `service` value, which makes every Harbor push fail with a JSON
+        // decode error on the returned HTML page.
+        let (realm, announcedService) = await discoverTokenEndpoint()
+        var components = URLComponents(string: realm)
+        var queryItems = components?.queryItems ?? []
+        queryItems.append(
+            URLQueryItem(name: "scope", value: "repository:\(repository):\(scopeString)"))
+        if let announcedService, !announcedService.isEmpty {
+            queryItems.append(URLQueryItem(name: "service", value: announcedService))
+        }
+        components?.queryItems = queryItems
+        guard let url = components?.url else {
+            Logger.error("Could not build token request URL from realm: \(realm)")
+            throw PushError.authenticationFailed
+        }
 
         var request = URLRequest(url: url)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
         request.httpMethod = "GET"  // Token endpoint uses GET
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -2455,6 +2528,12 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
         // *** End Basic Auth addition ***
 
         let (data, response) = try await URLSession.shared.data(for: request)
+
+        // The token endpoint sets a `sid` session cookie. Purge it so the subsequent
+        // Bearer-authenticated registry calls are not treated as session requests.
+        if let tokenURL = request.url, let stored = HTTPCookieStorage.shared.cookies(for: tokenURL) {
+            for cookie in stored { HTTPCookieStorage.shared.deleteCookie(cookie) }
+        }
 
         // Check response status code *before* parsing JSON
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -4095,6 +4174,9 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
     {
         let url = URL(string: "https://\(registry)/v2/\(repository)/blobs/\(digest)")!
         var request = URLRequest(url: url)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
         request.httpMethod = "HEAD"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
@@ -4110,6 +4192,9 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
     private func startBlobUpload(repository: String, token: String) async throws -> URL {
         let url = URL(string: "https://\(registry)/v2/\(repository)/blobs/uploads/")!
         var request = URLRequest(url: url)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
         request.httpMethod = "POST"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("0", forHTTPHeaderField: "Content-Length")  // Explicitly set Content-Length to 0 for POST
@@ -4167,6 +4252,9 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
         let fileSize = attrs[.size] as? Int64 ?? 0
 
         var request = URLRequest(url: uploadURL)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
         request.httpMethod = "PUT"
         request.timeoutInterval = 3600
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -4201,6 +4289,9 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
         }
 
         var request = URLRequest(url: uploadURL)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
         request.httpMethod = "PUT"
         request.timeoutInterval = 3600  // 1 hour for large blob uploads
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -4224,6 +4315,9 @@ class ImageContainerRegistry: ImageRegistry, @unchecked Sendable {
     {
         let url = URL(string: "https://\(registry)/v2/\(repository)/manifests/\(tag)")!
         var request = URLRequest(url: url)
+        // Registry calls must never carry Harbor session cookies; a stored `sid`
+        // makes Harbor treat the request as session auth and reply 403 CSRF.
+        request.httpShouldHandleCookies = false
         request.httpMethod = "PUT"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(
